@@ -28,7 +28,7 @@ def build_trip_pdf(result):
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
     from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
         KeepTogether,
     )
 

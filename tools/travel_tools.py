@@ -1,11 +1,11 @@
 # ============================================================
-# WANDERAI HACKATHON - LOCAL TRAVEL TOOLS
+# WANDERAI HACKATHON - TRAVEL TOOLS
 # ============================================================
-# This file contains demo/local travel data.
-# No paid APIs or real-time booking services are used.
-#
-# The data is for hackathon demonstration purposes only.
-# Prices are approximate demo values, not live prices.
+# Local planning catalogs plus live data tools. Weather and
+# geocoding use Open-Meteo; flights, hotels and attractions
+# use Aviationstack, StayingAPI and OpenTripMap when their API
+# keys are set, otherwise local planning estimates are shown.
+# Local prices are approximate demo values, not live prices.
 # ============================================================
 
 
@@ -1332,7 +1332,6 @@ AIRPORT_DESTINATIONS = {
 import os
 import re
 from datetime import date, timedelta
-from urllib.parse import urlencode
 
 import requests
 
@@ -1354,13 +1353,6 @@ def _request_json(url, params=None, headers=None):
         return None, f"Live data request failed: {exc}"
     except ValueError:
         return None, "Live data service returned an invalid response."
-
-
-def get_destination_data(destination):
-    """Return the old local catalog only for backward-compatible internal tests."""
-    if not destination:
-        return None
-    return DESTINATIONS.get(destination.lower().strip())
 
 
 COUNTRY_DEFAULT_DESTINATIONS = {
@@ -1920,7 +1912,6 @@ def flight_tool(destination, location=None):
     api_key = os.getenv("AVIATIONSTACK_API_KEY", "").strip()
     if not api_key:
         key = _local_destination_key((location or {}).get("planning_city") or destination)
-        local = DESTINATIONS.get(key, {})
         source_keys = [key] + LOCAL_REGION_KEYS.get(key, [])
         raw_options = []
         for source_key in source_keys:
@@ -2043,7 +2034,6 @@ def hotel_tool(destination, nights=3, adults=1, location=None):
     api_key = os.getenv("STAYINGAPI_KEY", "").strip()
     if not api_key:
         key = _local_destination_key((location or {}).get("planning_city") or destination)
-        local = DESTINATIONS.get(key, {})
         source_keys = [key] + LOCAL_REGION_KEYS.get(key, [])
         options=[]
         for source_key in source_keys:

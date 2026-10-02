@@ -1,354 +1,17 @@
 import html
 import json
-import os
 import re
 import time
-import requests
-import unicodedata
+from datetime import datetime
 import streamlit as st
 import streamlit.components.v1 as components
 
 from agent import TravelAgent
 from pdf_utils import build_trip_pdf
 
-IMAGE_TIMEOUT = 6
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _image_json(url, params=None, headers=None):
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=IMAGE_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# VERIFIED IMAGE ENGINE
-# ---------------------------------------------------------------------------
-# Rule: a card is not allowed onto the page merely because Wikimedia returned
-# an image. The image title/description must also agree with the item being
-# shown. If it does not, that item is rejected and an image-backed alternative
-# is searched for.
-#
-# Wikimedia's API exposes image URLs and extmetadata, which we use for this
-# semantic validation. See:
-# https://www.mediawiki.org/wiki/API:Imageinfo
-# ---------------------------------------------------------------------------
-
-IMAGE_BAD_WORDS = {
-    "document", "report", "pdf", "book", "cover", "scan", "scanned",
-    "article", "newspaper", "wikileaks", "cia", "assessment", "hearing",
-    "testimony", "map", "locator", "diagram", "chart", "graph", "table",
-    "logo", "flag", "seal", "screenshot", "manuscript", "thesis", "paper",
-    "poster", "page", "database", "archive", "file", "template", "letter",
-    "press release", "spreadsheet", "form", "dossier", "transcript",
-}
-
-GENERIC_WORDS = {
-    "the", "and", "of", "in", "at", "on", "a", "an", "to", "for",
-    "place", "local", "experience", "area", "city", "central", "stay",
-    "hotel", "resort", "residency", "option", "planning", "reference",
-    "food", "dish", "specialty", "regional", "tourist", "attraction",
-    "market", "walk", "time", "cafe", "leisure",
-}
-
-def _norm_words(value):
-    value = unicodedata.normalize("NFKD", _safe_text(value)).lower()
-    return [w for w in re.split(r"[^a-z0-9]+", value) if len(w) >= 3 and w not in GENERIC_WORDS]
-
-def _clean_html_text(value):
-    value = re.sub(r"<[^>]+>", " ", _safe_text(value))
-    return re.sub(r"\s+", " ", value).strip()
-
-def _image_metadata_text(page):
-    info = (page.get("imageinfo") or [{}])[0]
-    meta = info.get("extmetadata") or {}
-    pieces = [
-        re.sub(r"^file:\s*", "", _clean_html_text(page.get("title", "")), flags=re.I),
-        _clean_html_text((meta.get("ImageDescription") or {}).get("value", "")),
-        _clean_html_text((meta.get("Categories") or {}).get("value", "")),
-        _clean_html_text((meta.get("ObjectName") or {}).get("value", "")),
-    ]
-    return " ".join(pieces).lower()
-
-def _image_candidate_score(page, query, kind, destination="", subject=""):
-    info = (page.get("imageinfo") or [{}])[0]
-    url = info.get("thumburl") or info.get("url")
-    mime = _safe_text(info.get("mime")).lower()
-    if not url or not str(url).startswith(("http://", "https://")):
-        return -999, None
-    if mime and not mime.startswith("image/"):
-        return -999, None
-
-    title = re.sub(r"^file:\s*", "", _clean_html_text(page.get("title", "")), flags=re.I).lower()
-    blob = re.sub(r"\bfile:\s*", " ", _image_metadata_text(page), flags=re.I)
-
-    if any(bad in title or bad in blob for bad in IMAGE_BAD_WORDS):
-        return -999, None
-
-    subject_words = _norm_words(subject)
-    dest_words = _norm_words(destination)
-    query_words = _norm_words(query)
-
-    # Strong semantic anchors. For a named subject we require at least one
-    # distinctive subject word in the source title/metadata.
-    subject_hits = sum(1 for w in subject_words if w in blob)
-    dest_hits = sum(1 for w in dest_words if w in blob)
-    query_hits = sum(1 for w in query_words if w in blob)
-
-    if kind in {"place", "itinerary"}:
-        if subject_words and subject_hits == 0:
-            return -999, None
-        if len(subject_words) >= 2 and subject_hits == 0:
-            return -999, None
-    elif kind == "food":
-        if subject_words and subject_hits == 0:
-            return -999, None
-    elif kind == "hotel":
-        # Fake/local placeholder hotels must never inherit a city photograph.
-        if "placeholder" in subject.lower() or not subject_words:
-            return -999, None
-        if subject_hits == 0 and dest_hits == 0:
-            return -999, None
-    elif kind == "flight":
-        # Passenger-flight cards must never use military aircraft. For real
-        # airline names we prefer an airline/airliner match; for planning
-        # placeholders we require commercial/passenger aviation imagery.
-        military_terms = (
-            "military", "fighter", "warplane", "combat", "bomber",
-            "air force", "navy", "attack aircraft", "trainer aircraft",
-            "military aircraft",
-        )
-        if any(x in blob for x in military_terms):
-            return -999, None
-        commercial_terms = (
-            "commercial", "airliner", "airplane", "aircraft",
-            "aviation", "civil aviation", "airline",
-        )
-        if subject_words and subject_hits == 0 and not any(x in blob for x in commercial_terms):
-            return -999, None
-        if not subject_words and not any(x in blob for x in commercial_terms):
-            return -999, None
-
-    score = 0
-    score += subject_hits * 10
-    score += dest_hits * 3
-    score += query_hits * 2
-    if "photograph" in blob or "photo" in blob:
-        score += 1
-    if "aircraft" in blob or "airplane" in blob:
-        score += 2 if kind == "flight" else 0
-    if "food" in blob or "dish" in blob or "cuisine" in blob:
-        score += 2 if kind == "food" else 0
-
-    # Exact subject phrase in title is a very strong signal.
-    normalized_subject = " ".join(subject_words)
-    if normalized_subject and normalized_subject in title:
-        score += 18
-
-    return score, {
-        "url": url,
-        "title": page.get("title", ""),
-        "score": score,
-    }
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _wikimedia_candidates(query, limit=12):
-    payload = _image_json(
-        "https://commons.wikimedia.org/w/api.php",
-        params={
-            "action": "query",
-            "generator": "search",
-            "gsrsearch": query,
-            "gsrnamespace": 6,
-            "gsrlimit": min(20, max(5, limit)),
-            "prop": "imageinfo",
-            "iiprop": "url|mime|extmetadata",
-            "iiurlwidth": 1000,
-            "format": "json",
-        },
-    )
-    if not payload:
-        return []
-    return list((payload.get("query", {}).get("pages", {}) or {}).values())
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _verified_wikimedia_image(queries_tuple, kind, destination, subject):
-    """Return one semantically verified image, never merely the first search hit."""
-    for query in queries_tuple:
-        if not query:
-            continue
-        pages = _wikimedia_candidates(query, 14)
-        ranked = []
-        for page in pages:
-            score, candidate = _image_candidate_score(
-                page, query, kind, destination, subject
-            )
-            if candidate and score >= 8:
-                ranked.append(candidate)
-        ranked.sort(key=lambda x: x["score"], reverse=True)
-        if ranked:
-            return {
-                "url": ranked[0]["url"],
-                "label": "Verified reference image · Wikimedia Commons",
-                "title": ranked[0]["title"],
-            }
-    return None
 
 def _safe_text(value):
     return str(value or "").strip()
-
-
-def _candidate_queries(item, destination, kind):
-    item = item if isinstance(item, dict) else {}
-    name = _safe_text(item.get("name") or item.get("airline"))
-    area = _safe_text(item.get("area"))
-    category = _safe_text(item.get("category"))
-    planning = _safe_text(destination)
-
-    if kind == "flight":
-        airline = name if name and "flight option" not in name.lower() else ""
-        return [
-            (f"{airline} commercial airliner exterior", airline or "commercial airliner"),
-            (f"{airline} passenger airplane exterior", airline or "commercial airliner"),
-            ("commercial airliner aircraft exterior", "commercial airliner"),
-        ]
-
-    if kind == "hotel":
-        # Only real/listing-backed hotel names are eligible. A planning
-        # placeholder is not allowed to masquerade as a real hotel.
-        source = _safe_text(item.get("source")).lower()
-        if "placeholder" in source:
-            return []
-        return [
-            (f"{name} {planning}", name),
-            (f"{name} hotel {planning}", name),
-            (f"{area} hotel {planning}", area or name),
-        ]
-
-    if kind == "food":
-        return [
-            (f"{name} {planning} food", name),
-            (f"{name} {planning} dish", name),
-            (f"{name} cuisine {planning}", name),
-            (f"{name} traditional food", name),
-        ]
-
-    generic = {"city highlights", "local market", "scenic area", "local exploration",
-               "flexible experience", "neighbourhood walk", "neighborhood walk",
-               "local food experience", "cafe & leisure time", "café & leisure time"}
-    if name.lower() in generic:
-        return []
-    return [
-        (f"{name} {planning}", name),
-        (f"{name} {planning} attraction", name),
-        (f"{name} {planning} landmark", name),
-    ]
-
-
-def _discover_image_backed_alternatives(destination, kind, existing_names, needed=3):
-    """Discover replacement subjects directly from image-backed Commons results.
-
-    This is deliberately conservative: the returned subject comes from the
-    source image title itself, so the displayed content and image remain tied.
-    """
-    existing = {re.sub(r"\s+", " ", _safe_text(x).lower()) for x in existing_names}
-    if kind == "food":
-        queries = [
-            f"{destination} traditional food",
-            f"{destination} cuisine dishes",
-            f"{destination} local food",
-        ]
-    elif kind == "flight":
-        queries = [f"{destination} airport aircraft", f"{destination} aviation"]
-    elif kind == "hotel":
-        queries = [f"{destination} hotel", f"{destination} accommodation"]
-    else:
-        queries = [
-            f"{destination} tourist attractions",
-            f"{destination} landmarks",
-            f"{destination} places to visit",
-        ]
-
-    found = []
-    seen_titles = set()
-    for query in queries:
-        for page in _wikimedia_candidates(query, 20):
-            title = re.sub(r"^File:\s*", "", _safe_text(page.get("title")), flags=re.I)
-            title_clean = re.sub(r"\.[a-z0-9]{2,5}$", "", title, flags=re.I)
-            key = re.sub(r"\s+", " ", title_clean.lower()).strip()
-            if not key or key in existing or key in seen_titles:
-                continue
-
-            # Candidate subject must itself produce a high-confidence image.
-            score, candidate = _image_candidate_score(
-                page, query, kind, destination, title_clean
-            )
-            if not candidate or score < 8:
-                continue
-
-            # Remove obviously non-place/file-title noise.
-            if any(bad in key for bad in IMAGE_BAD_WORDS):
-                continue
-
-            seen_titles.add(key)
-            found.append({
-                "name": title_clean,
-                "category": "Image-backed alternative",
-                "image_url": candidate["url"],
-                "image_label": "Verified source image · Wikimedia Commons",
-                "source": "image-backed alternative",
-            })
-            if len(found) >= needed:
-                return found
-    return found
-
-
-def _resolve_verified_cards(items, destination, kind, max_items=6):
-    """Resolve cards and replace failed subjects with image-backed alternatives."""
-    original = [x for x in (items or []) if isinstance(x, dict)]
-    accepted = []
-    rejected_names = []
-    seen = set()
-
-    for item in original:
-        name = _safe_text(item.get("name") or item.get("airline"))
-        if not name or name.lower() in seen:
-            continue
-        seen.add(name.lower())
-
-        queries = _candidate_queries(item, destination, kind)
-        image = None
-        if item.get("image_url"):
-            # Existing provider images are accepted only for non-placeholder
-            # items; source-specific semantic validation is not possible here.
-            if "placeholder" not in _safe_text(item.get("source")).lower():
-                image = {"url": item["image_url"], "label": item.get("image_label") or "Verified source image"}
-
-        if not image and queries:
-            image = _verified_wikimedia_image(
-                tuple(q for q, _ in queries), kind, destination, name
-            )
-
-        if image:
-            accepted.append({**item, "image_url": image["url"], "image_label": image["label"]})
-        else:
-            rejected_names.append(name)
-
-        if len(accepted) >= max_items:
-            break
-
-    # Fill the missing slots with actual image-backed alternatives.
-    remaining = max_items - len(accepted)
-    if remaining > 0 and kind in {"place", "food", "hotel"}:
-        alternatives = _discover_image_backed_alternatives(
-            destination, kind, list(seen) + rejected_names, remaining
-        )
-        accepted.extend(alternatives[:remaining])
-
-    return accepted[:max_items]
 
 
 def _render_browser_image_cards(items, destination, kind, max_items=6):
@@ -396,19 +59,35 @@ def _render_browser_image_cards(items, destination, kind, max_items=6):
         })
 
     payload = json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")
-    height = max(285, ((len(cards) + 2) // 3) * 335 + 80)
+    # Initial estimate only; the frame resizes itself to its content once images resolve.
+    height = ((len(cards) + 2) // 3) * 340 + 24
 
     html_template = r"""<!doctype html>
 <html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-*{box-sizing:border-box} body{margin:0;font-family:Arial,sans-serif;background:transparent;color:#17324D}
-.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
-.card{overflow:hidden;border-radius:18px;background:rgba(255,255,255,.90);border:1px solid rgba(21,94,117,.12);box-shadow:0 8px 24px rgba(21,50,77,.08);min-height:285px}
-.photo{width:100%;height:190px;object-fit:cover;display:block;background:#eef5f3}
-.body{padding:12px 13px}.title{font-weight:750;font-size:16px;color:#155E75;margin-bottom:5px}
-.sub{font-size:12px;color:#557080;min-height:17px}.details{font-size:12px;color:#31556B;margin-top:6px}.source{font-size:10px;color:#718096;margin-top:8px}
-.status{padding:28px 16px;text-align:center;color:#718096;font-size:13px;grid-column:1/-1}
-@media(max-width:800px){.grid{grid-template-columns:1fr}.photo{height:180px}}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:transparent}
+body{font-family:'Plus Jakarta Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#0F2A3D;padding:4px 3px 12px;-webkit-font-smoothing:antialiased}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.card{display:flex;flex-direction:column;overflow:hidden;border-radius:18px;background:#fff;border:1px solid rgba(15,42,61,.08);box-shadow:0 1px 2px rgba(15,42,61,.04),0 8px 24px rgba(15,42,61,.06);transition:transform .2s ease,box-shadow .2s ease}
+.card:hover{transform:translateY(-3px);box-shadow:0 2px 4px rgba(15,42,61,.05),0 16px 36px rgba(15,42,61,.12)}
+.media{position:relative;aspect-ratio:16/10;overflow:hidden;background:#EEF3F2}
+.photo{width:100%;height:100%;object-fit:cover;display:block;transition:transform .5s ease}
+.card:hover .photo{transform:scale(1.04)}
+.body{display:flex;flex-direction:column;gap:4px;flex:1;padding:14px 16px 15px}
+.title{font-weight:700;font-size:15.5px;line-height:1.35;color:#0F2A3D;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.sub{font-size:12.5px;color:#5B7083;line-height:1.4}
+.details{font-size:12.5px;font-weight:600;color:#0F766E;margin-top:2px;line-height:1.45}
+.source{font-size:10.5px;color:#8A9AA8;margin-top:auto;padding-top:10px;letter-spacing:.01em}
+.status{grid-column:1/-1;padding:22px 18px;text-align:center;color:#5B7083;font-size:13px;border:1px dashed rgba(15,42,61,.16);border-radius:16px;background:rgba(255,255,255,.6)}
+.skeleton .media,.sk-line{background:linear-gradient(90deg,#EEF3F2 0%,#F8FBFA 50%,#EEF3F2 100%);background-size:200% 100%;animation:shimmer 1.3s ease-in-out infinite}
+.sk-line{height:11px;border-radius:6px;margin:5px 0}.sk-line.w70{width:70%}.sk-line.w40{width:40%}
+.skeleton:hover{transform:none}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+@media(max-width:860px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:540px){.grid{grid-template-columns:1fr}}
 </style></head><body><div id="grid" class="grid"></div>
 <script>
 const ITEMS = __PAYLOAD__;
@@ -464,8 +143,13 @@ async function resolve(item,usedUrls,usedSources){
  return null;
 }
 function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
-function renderCard(item,img){return `<div class="card"><img class="photo" src="${esc(img.url)}" alt="${esc(item.name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('.card').remove()"><div class="body"><div class="title">${esc(item.name)}</div><div class="sub">${esc(item.subtitle)}</div>${item.details?`<div class="details">${esc(item.details)}</div>`:''}<div class="source">${esc(img.label)}</div></div></div>`;}
-async function main(){const grid=document.getElementById('grid');grid.innerHTML='<div class="status">Finding verified images…</div>';const results=[];const usedUrls=new Set();const usedSources=new Set();for(const item of ITEMS){const img=await resolve(item,usedUrls,usedSources);if(img){usedUrls.add(img.url);if(img.sourceTitle)usedSources.add(norm(img.sourceTitle));results.push({item,img});}}if(!results.length){grid.innerHTML='<div class="status">No verified matching images were available from the connected image sources.</div>';return;}grid.innerHTML=results.map(x=>renderCard(x.item,x.img)).join('');}
+function renderCard(item,img){return `<article class="card"><div class="media"><img class="photo" src="${esc(img.url)}" alt="${esc(item.name)}" loading="lazy" referrerpolicy="no-referrer" onload="fit()" onerror="this.closest('.card').remove();fit()"></div><div class="body"><div class="title">${esc(item.name)}</div><div class="sub">${esc(item.subtitle)}</div>${item.details?`<div class="details">${esc(item.details)}</div>`:''}<div class="source">${esc(img.label)}</div></div></article>`;}
+function skeleton(n){return Array.from({length:n},()=>'<div class="card skeleton"><div class="media"></div><div class="body"><div class="sk-line w70"></div><div class="sk-line w40"></div></div></div>').join('');}
+// Same-origin srcdoc frame: size the host iframe to the real content to avoid empty gaps.
+function fit(){try{const f=window.frameElement;if(!f)return;const g=document.getElementById('grid');const h=g.childElementCount?Math.ceil(g.getBoundingClientRect().bottom+14):0;f.style.height=h+'px';f.setAttribute('height',h);const host=f.closest('[data-testid="stElementContainer"],.element-container');if(host)host.style.display=h?'':'none';}catch(e){}}
+async function main(){const grid=document.getElementById('grid');grid.innerHTML=skeleton(ITEMS.length);fit();const results=[];const usedUrls=new Set();const usedSources=new Set();for(const item of ITEMS){const img=await resolve(item,usedUrls,usedSources);if(img){usedUrls.add(img.url);if(img.sourceTitle)usedSources.add(norm(img.sourceTitle));results.push({item,img});}}if(!results.length){grid.innerHTML=(ITEMS[0]&&ITEMS[0].kind==='itinerary')?'':'<div class="status">No verified matching images were available from the connected image sources.</div>';fit();return;}grid.innerHTML=results.map(x=>renderCard(x.item,x.img)).join('');fit();}
+if(window.ResizeObserver)new ResizeObserver(()=>fit()).observe(document.getElementById('grid'));
+window.addEventListener('resize',fit);
 main();
 </script></body></html>"""
     html_out = html_template.replace("__PAYLOAD__", payload).replace("__DEST__", json.dumps(destination))
@@ -473,123 +157,127 @@ main();
     return len(cards)
 
 
-# ---------------------------------------------------------------------------
-# Legacy helper kept for compatibility with any existing code paths.
-# It now uses the verified resolver instead of first-hit search.
-# ---------------------------------------------------------------------------
-def _get_item_image(item, destination, kind):
-    name = _safe_text((item or {}).get("name") or (item or {}).get("airline"))
-    queries = _candidate_queries(item or {}, destination, kind)
-    if not queries:
-        return None
-    return _verified_wikimedia_image(tuple(q for q, _ in queries), kind, destination, name)
-
-def _itinerary_image(item, destination):
-    return _get_item_image(item, destination, "itinerary")
-
-def _render_media_card(item, destination, kind, subtitle=""):
-    image = _get_item_image(item, destination, kind)
-    if not image:
-        return ""
-    name = html.escape(_safe_text(item.get("name") or item.get("airline") or "Travel option"))
-    sub = html.escape(subtitle or _safe_text(item.get("category") or item.get("area") or item.get("route")))
-    return (
-        f"<div class='media-card'><img src='{html.escape(image['url'], quote=True)}' alt='{name}' "
-        f"loading='lazy' onerror='this.closest(\".media-card\").remove()'>"
-        f"<div class='media-body'><h4>{name}</h4><p>{sub}</p></div></div>"
-    )
-
 st.set_page_config(page_title="WanderAI", page_icon="✈️", layout="wide")
 
 st.markdown(
-    '''
+    """
 <style>
-.day-card{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);border-radius:22px;padding:24px;margin:18px 0;box-shadow:0 12px 35px rgba(0,0,0,.14);backdrop-filter:blur(12px)}
-.day-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:20px}
-.day-label{font-size:13px;font-weight:800;letter-spacing:1.5px;opacity:.78}
-.day-card h3{margin:4px 0 3px 0;font-size:25px}.day-theme{opacity:.78}
-.day-badge{border:1px solid rgba(64,224,208,.55);border-radius:999px;padding:7px 12px;font-size:11px;font-weight:800}
-.day-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-.day-section{background:rgba(255,255,255,.07);border-radius:16px;padding:15px}.day-section h4{margin:0 0 10px}
-.itinerary-item{padding:9px 0;border-bottom:1px solid rgba(255,255,255,.10)}.itinerary-item:last-child{border-bottom:0}
-.itinerary-item span{opacity:.76;font-size:13px}.day-footer{display:flex;flex-wrap:wrap;gap:18px;margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12)}
-.day-note{margin-top:12px;opacity:.72;font-size:13px}
-.media-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:16px}
-.media-card{overflow:hidden;border-radius:18px;background:rgba(255,255,255,.72);border:1px solid rgba(21,94,117,.10);box-shadow:0 8px 24px rgba(21,50,77,.07)}
-.media-card img{width:100%;height:190px;object-fit:cover;display:block}
-.media-body{padding:12px 13px}.media-body h4{margin:0 0 5px;color:#155E75}.media-body p{margin:0;color:#557080;font-size:13px}
-.itinerary-media{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}
-.itinerary-media-card{overflow:hidden;border-radius:16px;background:rgba(255,255,255,.62);border:1px solid rgba(21,94,117,.10)}
-.itinerary-media-card img{width:100%;height:145px;object-fit:cover;display:block}.itinerary-media-card div{padding:9px 11px;font-size:13px;font-weight:700;color:#31556B}
-@media(max-width:800px){.day-grid,.media-grid,.itinerary-media{grid-template-columns:1fr}.day-card-header{flex-direction:column}}
-@media(max-width:800px){.day-grid{grid-template-columns:1fr}.day-card-header{flex-direction:column}}
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Playfair+Display:wght@600;700&display=swap');
+:root{
+  --ink:#0F2A3D;--muted:#5B7083;--brand:#0F766E;--brand-deep:#0F4C5C;--accent:#E9A23B;
+  --surface:#FFFFFF;--surface-soft:#F6F9F8;--line:rgba(15,42,61,.08);--line-strong:rgba(15,42,61,.14);
+  --radius-lg:22px;--radius:16px;
+  --shadow-sm:0 1px 2px rgba(15,42,61,.04),0 4px 14px rgba(15,42,61,.05);
+  --shadow:0 2px 4px rgba(15,42,61,.04),0 14px 34px rgba(15,42,61,.08);
+  --font-sans:'Plus Jakarta Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  --font-display:'Playfair Display',Georgia,'Times New Roman',serif;
+}
+/* ---------- Base ---------- */
+html,body,.stApp{font-family:var(--font-sans);-webkit-font-smoothing:antialiased}
+.stApp{color:var(--ink);background:
+  radial-gradient(1100px 520px at -5% -10%,rgba(233,162,59,.12),transparent 60%),
+  radial-gradient(900px 520px at 105% 0%,rgba(15,118,110,.10),transparent 55%),#F7F6F2}
+.stApp p,.stApp li,.stApp label,.stApp input,.stApp textarea,.stApp button{font-family:var(--font-sans)}
+header[data-testid="stHeader"]{background:transparent}
+[data-testid="stDecoration"],footer{display:none}
+.block-container{max-width:1180px;padding:2.25rem 1.5rem 5rem}
+/* Style-only markdown blocks should not occupy layout space. */
+[data-testid="stElementContainer"]:has(style),.element-container:has(style){display:none}
+[data-testid="stHeaderActionElements"]{display:none}
+.stApp [data-testid="stMarkdownContainer"] h2{font-family:var(--font-display);font-weight:700;font-size:1.7rem;line-height:1.25;letter-spacing:-.01em;color:var(--ink);margin:2.25rem 0 .2rem;padding:0 0 .65rem;border-bottom:1px solid var(--line)}
+.stApp [data-testid="stMarkdownContainer"] h3{font-weight:700;font-size:1.12rem;color:var(--ink);margin:.4rem 0 0;padding:0}
+.stApp [data-testid="stCaptionContainer"]{color:var(--muted);font-size:.9rem}
+/* ---------- Hero ---------- */
+.hero{position:relative;overflow:hidden;padding:2.6rem 2.75rem 2.4rem;border-radius:28px;margin-bottom:.75rem;color:#fff;
+  background:linear-gradient(135deg,#0F4C5C 0%,#0F766E 58%,#14958A 100%);box-shadow:0 24px 60px rgba(15,76,92,.24)}
+.hero::before{content:"";position:absolute;right:-140px;top:-160px;width:420px;height:420px;border-radius:50%;background:radial-gradient(circle,rgba(233,162,59,.38),transparent 65%)}
+.hero::after{content:"";position:absolute;left:-80px;bottom:-180px;width:360px;height:360px;border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,.10),transparent 65%)}
+.hero>*{position:relative;z-index:1}
+.hero-eyebrow{display:inline-block;font-size:.7rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;padding:.38rem .8rem;border-radius:999px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22)}
+.stApp .hero h1{font-family:var(--font-display);font-weight:700;font-size:3.2rem;line-height:1.08;letter-spacing:-.015em;color:#fff;margin:.9rem 0 .35rem;padding:0}
+.stApp .hero .hero-lead{font-size:1.2rem;font-weight:600;color:rgba(255,255,255,.95);margin:0 0 .45rem}
+.stApp .hero .hero-sub{max-width:720px;font-size:1rem;line-height:1.65;color:rgba(255,255,255,.80);margin:0}
+.hero-chips{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1.4rem}
+.hero-chips span{font-size:.8rem;font-weight:600;padding:.42rem .85rem;border-radius:999px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);color:#fff}
+/* ---------- Surfaces ---------- */
+.glass-card,.metric,.agent-card{background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow-sm)}
+.glass-card{padding:1.15rem 1.35rem;border-radius:var(--radius);margin:.25rem 0 .75rem;line-height:1.6;color:var(--ink)}
+.glass-card h3,.glass-card h4{color:var(--brand-deep)}
+.approval-card{border-left:4px solid var(--accent)}
+.metric{padding:1.05rem 1.2rem;border-radius:var(--radius)}
+.metric-title{color:var(--muted);font-size:.7rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase}
+.metric-value{color:var(--ink);font-size:1.3rem;font-weight:700;margin-top:.35rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-card{display:flex;flex-wrap:wrap;gap:.5rem;padding:1rem 1.1rem;border-radius:var(--radius);margin:.25rem 0 .75rem}
+.agent-step{display:inline-flex;align-items:center;gap:.45rem;padding:.42rem .85rem;border-radius:999px;background:#F1F7F6;border:1px solid rgba(15,118,110,.14);color:#1F4E5A;font-size:.84rem;font-weight:600}
+.agent-step .tick{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;background:var(--brand);color:#fff;font-size:.65rem}
+.live-pill,.partial-pill{display:inline-flex;align-items:center;gap:.35rem;padding:.38rem .85rem;border-radius:999px;font-weight:700;font-size:.76rem;letter-spacing:.02em}
+.live-pill{background:#DDF5EF;color:#0F766E;border:1px solid rgba(15,118,110,.18)}
+.partial-pill{background:#FFF1DB;color:#8A5A16;border:1px solid rgba(233,162,59,.30)}
+.info-box,.warn-box{padding:.95rem 1.2rem;border-radius:14px;margin:.5rem 0 .75rem;font-size:.93rem;line-height:1.6}
+.info-box{background:#EFF7F6;border:1px solid rgba(15,118,110,.14);border-left:4px solid var(--brand);color:#1F4E5A}
+.warn-box{background:#FFF7EA;border:1px solid rgba(233,162,59,.28);border-left:4px solid var(--accent);color:#7A4E12}
+/* ---------- Native widgets ---------- */
+[data-testid="stMetric"]{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:1rem 1.15rem;box-shadow:var(--shadow-sm)}
+[data-testid="stMetricLabel"] p{font-size:.7rem!important;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+[data-testid="stMetricValue"]{font-size:1.4rem;font-weight:700;color:var(--ink)}
+[data-testid="stAlertContainer"]{border-radius:14px}
+[data-baseweb="textarea"],[data-baseweb="input"]{background:#fff!important;border:1px solid var(--line-strong)!important;border-radius:14px!important;box-shadow:var(--shadow-sm);transition:border-color .15s ease,box-shadow .15s ease}
+[data-baseweb="textarea"]:focus-within,[data-baseweb="input"]:focus-within{border-color:var(--brand)!important;box-shadow:0 0 0 3px rgba(15,118,110,.14)!important}
+[data-testid="stTextArea"] textarea,[data-testid="stTextInput"] input{background:#fff!important;color:var(--ink)!important;caret-color:var(--brand)!important;font-size:.98rem!important;line-height:1.55!important;padding:.85rem 1rem!important}
+[data-testid="stTextArea"] textarea::placeholder,[data-testid="stTextInput"] input::placeholder{color:#8A9AA8!important;opacity:1!important}
+.stButton>button,.stDownloadButton>button{font-family:var(--font-sans);font-weight:600;font-size:.95rem;min-height:2.85rem;padding:.6rem 1.1rem;border-radius:12px;transition:transform .15s ease,box-shadow .15s ease,background .15s ease,border-color .15s ease,color .15s ease}
+.stButton>button[kind="primary"],.stDownloadButton>button[kind="primary"]{background:linear-gradient(135deg,#0F766E 0%,#0F4C5C 100%);color:#fff;border:0;box-shadow:0 8px 20px rgba(15,118,110,.22)}
+.stButton>button[kind="primary"]:hover,.stDownloadButton>button[kind="primary"]:hover{transform:translateY(-1px);box-shadow:0 12px 26px rgba(15,118,110,.30);color:#fff}
+.stButton>button[kind="primary"]:focus,.stButton>button[kind="primary"]:active,.stDownloadButton>button[kind="primary"]:focus,.stDownloadButton>button[kind="primary"]:active{color:#fff!important}
+.stButton>button[kind="secondary"],.stDownloadButton>button[kind="secondary"]{background:var(--surface);color:var(--ink);border:1px solid var(--line-strong);box-shadow:var(--shadow-sm)}
+.stButton>button[kind="secondary"]:hover,.stDownloadButton>button[kind="secondary"]:hover{border-color:var(--brand);color:var(--brand);background:#F1F8F7}
+.stButton>button:focus-visible,.stDownloadButton>button:focus-visible{outline:3px solid rgba(15,118,110,.35);outline-offset:2px}
+/* ---------- Weather ---------- */
+.forecast-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(138px,1fr));gap:.75rem;margin:.9rem 0 .25rem}
+.forecast-tile{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:.85rem .95rem;box-shadow:var(--shadow-sm)}
+.forecast-date{font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.forecast-temp{font-size:1.05rem;font-weight:700;color:var(--ink);margin:.3rem 0 .15rem}
+.forecast-temp span{color:var(--muted);font-weight:500}
+.forecast-rain{font-size:.8rem;color:#2C6E8F}
+/* ---------- Itinerary ---------- */
+.day-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:1.5rem 1.6rem 1.25rem;margin:1.1rem 0 .5rem;box-shadow:var(--shadow)}
+.day-card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin-bottom:1.1rem}
+.day-label{font-size:.7rem;font-weight:800;letter-spacing:.16em;color:var(--brand)}
+.stApp .day-card h3{font-family:var(--font-display);font-size:1.55rem;font-weight:700;line-height:1.25;color:var(--ink);margin:.3rem 0 .15rem;padding:0}
+.day-theme{color:var(--muted);font-size:.93rem}
+.day-badge{white-space:nowrap;background:#FFF4E2;color:#9A5B0B;border:1px solid rgba(233,162,59,.35);border-radius:999px;padding:.35rem .8rem;font-size:.68rem;font-weight:800;letter-spacing:.08em}
+.day-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.9rem}
+.day-section{background:var(--surface-soft);border:1px solid var(--line);border-radius:var(--radius);padding:1rem 1.05rem .6rem}
+.stApp .day-section h4{margin:0 0 .35rem;padding:0;font-size:.76rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--brand-deep)}
+.itinerary-item{padding:.6rem 0;border-bottom:1px dashed rgba(15,42,61,.10);font-size:.93rem;line-height:1.45;color:var(--ink)}
+.itinerary-item:last-child{border-bottom:0}
+.itinerary-item span{color:var(--muted);font-size:.85rem}
+.day-footer{display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;margin-top:1rem;padding-top:.9rem;border-top:1px solid var(--line);font-size:.9rem;color:var(--ink)}
+.day-note{margin-top:.5rem;color:var(--muted);font-size:.85rem}
+/* ---------- Responsive ---------- */
+@media(max-width:900px){.day-grid{grid-template-columns:1fr}}
+@media(max-width:640px){
+  .block-container{padding:1.25rem .9rem 4rem}
+  .hero{padding:1.8rem 1.4rem;border-radius:22px}
+  .stApp .hero h1{font-size:2.3rem}
+  .day-card{padding:1.15rem}
+  .day-card-header{flex-direction:column}
+}
 </style>
-    ''',
+""",
     unsafe_allow_html=True,
 )
 
 st.markdown(
-    '''
-    <style>
-    .stApp {
-        background:
-            radial-gradient(circle at 12% 8%, rgba(244,184,96,.22), transparent 25%),
-            radial-gradient(circle at 88% 12%, rgba(15,118,110,.16), transparent 28%),
-            linear-gradient(135deg, #FFF7ED 0%, #F4F8F4 45%, #E8F7F5 100%);
-        color: #17324D;
-    }
-    .block-container { max-width: 1250px; padding-top: 2rem; padding-bottom: 4rem; }
-    .hero, .glass-card, .metric, .agent-card {
-        background: rgba(255,255,255,.72);
-        border: 1px solid rgba(21,94,117,.12);
-        box-shadow: 0 12px 35px rgba(21,50,77,.08);
-        backdrop-filter: blur(14px);
-    }
-    .hero { padding: 2.2rem; border-radius: 30px; margin-bottom: 1.4rem; }
-    .hero h1 { color: #155E75; font-size: 3rem; margin-bottom: .2rem; }
-    .hero p { color: #557080; font-size: 1.08rem; margin: .25rem 0; }
-    .glass-card { padding: 1.2rem; border-radius: 20px; margin-bottom: 1rem; }
-    .glass-card h3, .glass-card h4 { color: #155E75; }
-    .metric { padding: 1rem; border-radius: 18px; text-align: center; }
-    .metric-title { color: #557080; font-size: .88rem; }
-    .metric-value { color: #17324D; font-size: 1.35rem; font-weight: 750; margin-top: .25rem; }
-    .agent-card { padding: 1rem 1.2rem; border-radius: 20px; margin: 1rem 0; }
-    .agent-step { padding: .42rem 0; color: #31556B; }
-    .live-pill { display:inline-block; padding:.25rem .65rem; border-radius:999px; background:#DDF5EF; color:#0F766E; font-weight:700; font-size:.78rem; }
-    .partial-pill { display:inline-block; padding:.25rem .65rem; border-radius:999px; background:#FFF0D8; color:#8A5A16; font-weight:700; font-size:.78rem; }
-    .info-box { padding:1rem 1.2rem; border-radius:18px; background:#EAF7F5; border:1px solid #B9E4DE; color:#24566A; margin:1rem 0; }
-    .warn-box { padding:1rem 1.2rem; border-radius:18px; background:#FFF5E6; border:1px solid #F2D09A; color:#76531D; margin:1rem 0; }
-    /* Keep the trip-request field consistent across light/dark browser themes. */
-    div[data-testid="stTextArea"] textarea, textarea {
-        background:#FFFFFF !important;
-        color:#17324D !important;
-        border:1px solid rgba(21,94,117,.20) !important;
-        border-radius:18px !important;
-        caret-color:#0F766E !important;
-        box-shadow:0 8px 24px rgba(21,50,77,.06) !important;
-    }
-    div[data-testid="stTextArea"] textarea::placeholder, textarea::placeholder {
-        color:#718096 !important;
-        opacity:1 !important;
-    }
-    div[data-testid="stTextArea"] textarea:focus, textarea:focus {
-        border-color:#0F766E !important;
-        box-shadow:0 0 0 2px rgba(15,118,110,.12) !important;
-    }
-    div.stButton > button { border-radius:14px; border:0; color:white; font-weight:750; background:linear-gradient(90deg,#0F766E,#155E75); }
-    </style>
-    ''',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    '''
-    <div class="hero">
-        <h1>✈️ WanderAI</h1>
-        <p>Your AI-Powered Travel Agent</p>
-        <p>Describe your trip naturally. WanderAI resolves the destination, checks connected live travel sources and prepares the information needed for planning.</p>
-    </div>
-    ''',
+    """
+<div class="hero">
+<span class="hero-eyebrow">AI Travel Concierge</span>
+<h1>WanderAI</h1>
+<p class="hero-lead">Your AI-Powered Travel Agent</p>
+<p class="hero-sub">Describe your trip naturally. WanderAI resolves the destination, checks connected live travel sources and prepares the information needed for planning.</p>
+<div class="hero-chips"><span>🌦️ Live weather</span><span>✈️ Flights &amp; stays</span><span>🗺️ Day-by-day itinerary</span><span>📄 Approved PDF export</span></div>
+</div>
+""",
     unsafe_allow_html=True,
 )
 
@@ -612,7 +300,7 @@ request = st.text_area(
     label_visibility="collapsed",
 )
 
-create_plan = st.button("✨ Create My Travel Plan", use_container_width=True)
+create_plan = st.button("✨ Create My Travel Plan", use_container_width=True, type="primary")
 
 if create_plan:
     if not request.strip():
@@ -634,7 +322,7 @@ if create_plan:
             shown.append(step)
             status_box.markdown(
                 '<div class="agent-card">' +
-                "".join(f'<div class="agent-step">✓ {html.escape(item)}</div>' for item in shown) +
+                "".join(f'<div class="agent-step"><span class="tick">✓</span>{html.escape(item)}</div>' for item in shown) +
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -688,14 +376,14 @@ st.markdown("## ⚡ WanderAI Agent")
 steps = result.get("agent_steps", [])
 st.markdown(
     '<div class="agent-card">' + "".join(
-        f'<div class="agent-step">✓ {html.escape(step)}</div>' for step in steps
+        f'<div class="agent-step"><span class="tick">✓</span>{html.escape(step)}</div>' for step in steps
     ) + "</div>",
     unsafe_allow_html=True,
 )
 
 if result.get("live_sources"):
     st.markdown(
-        f'<span class="live-pill">● LIVE DATA: {", ".join(result["live_sources"])}</span>',
+        f'<span class="live-pill">● LIVE DATA: {html.escape(", ".join(map(str, result["live_sources"])))}</span>',
         unsafe_allow_html=True,
     )
 else:
@@ -703,59 +391,6 @@ else:
         '<span class="partial-pill">● Some live travel sources still need to be connected</span>',
         unsafe_allow_html=True,
     )
-
-# ---------------------------------------------------------------------------
-# HUMAN-IN-THE-LOOP APPROVAL
-# The agent prepares the plan first. PDF export is blocked until the human
-# explicitly approves the current plan. A rejection sends the user to the
-# existing re-planning flow, and any revised plan requires approval again.
-# ---------------------------------------------------------------------------
-approval_state = st.session_state.get("approval_state", "pending")
-st.markdown("## 👤 Human Approval")
-if approval_state == "pending":
-    st.markdown(
-        f"""<div class="glass-card"><strong>WanderAI has prepared your trip.</strong><br>
-        Destination: <strong>{html.escape(str(destination))}</strong> ·
-        {html.escape(str(nights + 1))} days / {html.escape(str(nights))} nights.<br>
-        Review the plan below. <strong>The PDF will only be enabled after you approve it.</strong></div>""",
-        unsafe_allow_html=True,
-    )
-    approve_col, change_col = st.columns(2)
-    with approve_col:
-        approve_clicked = st.button("✅ Yes, approve this trip", use_container_width=True, key="approve_trip")
-    with change_col:
-        change_clicked = st.button("✏️ No, I want changes", use_container_width=True, key="reject_trip")
-    if approve_clicked:
-        try:
-            st.session_state.approval_pdf = build_trip_pdf(result)
-            st.session_state.approval_state = "approved"
-            st.session_state.approval_message = "Trip approved. Your PDF is ready."
-            st.rerun()
-        except Exception as exc:
-            st.session_state.approval_message = f"PDF generation failed: {exc}"
-            st.session_state.approval_state = "pdf_error"
-            st.rerun()
-    if change_clicked:
-        st.session_state.approval_state = "changes_requested"
-        st.session_state.approval_message = "Tell WanderAI what you want changed, then approve the revised plan."
-        st.rerun()
-elif approval_state == "approved":
-    st.success(st.session_state.get("approval_message") or "Trip approved.")
-    pdf_bytes = st.session_state.get("approval_pdf")
-    if pdf_bytes:
-        safe_destination = re.sub(r"[^A-Za-z0-9]+", "_", str(destination)).strip("_") or "trip"
-        st.download_button(
-            "📄 Download Approved Trip Summary (PDF)",
-            data=pdf_bytes,
-            file_name=f"WanderAI_{safe_destination}_Trip_Summary.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-            key="download_trip_pdf",
-        )
-elif approval_state == "changes_requested":
-    st.info(st.session_state.get("approval_message") or "Tell WanderAI what you want changed.")
-elif approval_state == "pdf_error":
-    st.error(st.session_state.get("approval_message") or "The PDF could not be generated.")
 
 # Weather
 weather = results.get("weather") or {}
@@ -766,11 +401,21 @@ if weather.get("available"):
     with a: st.metric("Temperature", f"{current.get('temperature_2m', '—')} °C")
     with b: st.metric("Feels Like", f"{current.get('apparent_temperature', '—')} °C")
     with c: st.metric("Wind", f"{current.get('wind_speed_10m', '—')} km/h")
+    tiles = []
     for row in weather.get("daily", [])[:min(7, nights + 2)]:
-        st.markdown(
-            f'<div class="glass-card"><strong>{row["date"]}</strong> · {row.get("low", "—")}°C – {row.get("high", "—")}°C · Rain chance {row.get("rain_probability", "—")}%</div>',
-            unsafe_allow_html=True,
+        raw_date = str(row.get("date", ""))
+        try:
+            label = datetime.strptime(raw_date, "%Y-%m-%d").strftime("%a, %d %b")
+        except ValueError:
+            label = raw_date
+        tiles.append(
+            f'<div class="forecast-tile"><div class="forecast-date">{html.escape(label)}</div>'
+            f'<div class="forecast-temp">{html.escape(str(row.get("high", "—")))}° '
+            f'<span>/ {html.escape(str(row.get("low", "—")))}°</span></div>'
+            f'<div class="forecast-rain">💧 {html.escape(str(row.get("rain_probability", "—")))}% rain</div></div>'
         )
+    if tiles:
+        st.markdown(f'<div class="forecast-grid">{"".join(tiles)}</div>', unsafe_allow_html=True)
 
 # Flights
 flight = results.get("flight") or {}
@@ -880,8 +525,9 @@ replan_request = st.text_input(
     "Trip refinement",
     value=st.session_state.get("replan_request", ""),
     placeholder="Example: make the hotel cheaper, add more beaches, or add 1 day",
+    label_visibility="collapsed",
 )
-replan_button = st.button("🔄 Re-plan My Trip", use_container_width=True)
+replan_button = st.button("🔄 Re-plan My Trip", use_container_width=True, type="primary")
 
 if replan_button:
     if not replan_request.strip():
@@ -921,7 +567,8 @@ if itinerary:
                 if isinstance(plan_item, dict) and _safe_text(plan_item.get("name")):
                     itinerary_image_items.append({**plan_item, "category": slot.title()})
                     break
-        media_block = ""
+        travel_note = _safe_text(day.get("travel_note"))
+        note_block = f'<div class="day-note">🚗 {html.escape(travel_note)}</div>' if travel_note else ""
 
         st.markdown(
             f"""<div class="day-card">
@@ -929,7 +576,6 @@ if itinerary:
 <div><div class="day-label">DAY {day_num}</div><h3>{title}</h3><div class="day-theme">{theme}</div></div>
 <div class="day-badge">✨ EXPLORE</div>
 </div>
-{media_block}
 <div class="day-grid">
 <div class="day-section"><h4>☀️ Morning</h4>{render_items(day.get("morning"))}</div>
 <div class="day-section"><h4>🌤️ Afternoon</h4>{render_items(day.get("afternoon"))}</div>
@@ -938,8 +584,7 @@ if itinerary:
 <div class="day-footer">
 <span>🍽️ <strong>Food:</strong> {html.escape(str(day.get("food") or "Local food experience"))}</span>
 <span>💰 <strong>Day estimate:</strong> {html.escape(str(day.get("estimated_day_cost") or "Not specified"))}</span>
-</div>
-<div class="day-note">🚗 {html.escape(str(day.get("travel_note") or ""))}</div>
+</div>{note_block}
 </div>""",
             unsafe_allow_html=True,
         )
@@ -947,3 +592,57 @@ if itinerary:
             _render_browser_image_cards(itinerary_image_items, destination, "itinerary", max_items=3)
 else:
     st.info("A day-wise itinerary could not be generated for this request.")
+
+# ---------------------------------------------------------------------------
+# HUMAN-IN-THE-LOOP APPROVAL
+# The agent prepares the plan first. PDF export is blocked until the human
+# explicitly approves the current plan. A rejection sends the user to the
+# existing re-planning flow, and any revised plan requires approval again.
+# ---------------------------------------------------------------------------
+approval_state = st.session_state.get("approval_state", "pending")
+st.markdown("## 👤 Human Approval")
+if approval_state in ("pending", "pdf_error"):
+    if approval_state == "pdf_error":
+        st.error(st.session_state.get("approval_message") or "The PDF could not be generated.")
+    st.markdown(
+        f"""<div class="glass-card approval-card"><strong>WanderAI has prepared your trip.</strong><br>
+        Destination: <strong>{html.escape(str(destination))}</strong> ·
+        {html.escape(str(nights + 1))} days / {html.escape(str(nights))} nights.<br>
+        Review the plan above. <strong>The PDF will only be enabled after you approve it.</strong></div>""",
+        unsafe_allow_html=True,
+    )
+    approve_col, change_col = st.columns(2)
+    with approve_col:
+        approve_clicked = st.button("✅ Yes, approve this trip", use_container_width=True, key="approve_trip", type="primary")
+    with change_col:
+        change_clicked = st.button("✏️ No, I want changes", use_container_width=True, key="reject_trip")
+    if approve_clicked:
+        try:
+            st.session_state.approval_pdf = build_trip_pdf(result)
+            st.session_state.approval_state = "approved"
+            st.session_state.approval_message = "Trip approved. Your PDF is ready."
+            st.rerun()
+        except Exception as exc:
+            st.session_state.approval_message = f"PDF generation failed: {exc}"
+            st.session_state.approval_state = "pdf_error"
+            st.rerun()
+    if change_clicked:
+        st.session_state.approval_state = "changes_requested"
+        st.session_state.approval_message = "Use “Refine This Trip” above to tell WanderAI what you want changed, then approve the revised plan."
+        st.rerun()
+elif approval_state == "approved":
+    st.success(st.session_state.get("approval_message") or "Trip approved.")
+    pdf_bytes = st.session_state.get("approval_pdf")
+    if pdf_bytes:
+        safe_destination = re.sub(r"[^A-Za-z0-9]+", "_", str(destination)).strip("_") or "trip"
+        st.download_button(
+            "📄 Download Approved Trip Summary (PDF)",
+            data=pdf_bytes,
+            file_name=f"WanderAI_{safe_destination}_Trip_Summary.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_trip_pdf",
+            type="primary",
+        )
+elif approval_state == "changes_requested":
+    st.info(st.session_state.get("approval_message") or "Tell WanderAI what you want changed.")

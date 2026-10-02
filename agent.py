@@ -1,10 +1,6 @@
 import json
-import os
 import re
 import unicodedata
-from datetime import date
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 try:
     from google import genai
@@ -72,12 +68,6 @@ class TravelAgent:
                 self.client = None
         except Exception:
             self.client = None
-
-    def _safe_json(self, raw):
-        raw = (raw or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
-        raw = re.sub(r"\s*```$", "", raw)
-        return json.loads(raw)
 
     def extract_budget(self, text):
         text_lower = text.lower().replace(",", "")
@@ -694,7 +684,6 @@ Return ONLY JSON in this exact shape:
         return normalized if len(normalized) == days else []
 
     @staticmethod
-    @staticmethod
     def _normalize_itinerary_items(items):
         if not isinstance(items, list):
             return []
@@ -981,16 +970,6 @@ Return ONLY JSON in this exact shape:
                 names.append(TravelAgent._activity_key(item["name"]))
         return len(names) == len(set(names))
 
-    @staticmethod
-    def _has_sufficient_unique_itinerary(days_data):
-        names = []
-        for day in days_data or []:
-            for slot in ("morning", "afternoon", "evening"):
-                for item in day.get(slot, []):
-                    if isinstance(item, dict) and item.get("name"):
-                        names.append(re.sub(r"[^a-z0-9]+", " ", str(item["name"]).lower()).strip())
-        return bool(names) and len(names) == len(set(names))
-
     # Deterministic safety-net knowledge for common travel destinations. This is
     # deliberately used only when live attraction data and Gemini are unavailable.
     DESTINATION_FALLBACKS = {
@@ -1163,58 +1142,6 @@ Return ONLY JSON in this exact shape:
             ("Local market", "Browse local crafts and food respectfully."),
         ],
     }
-
-    @staticmethod
-    def _dynamic_wikipedia_attractions(destination, location=None, limit=18):
-        """Find nearby named places without requiring a destination-specific catalog or API key.
-
-        Wikipedia's public geosearch is used only as a safety-net source. It supplies
-        names of nearby pages/landmarks; it is not treated as booking or price data.
-        If unavailable, the itinerary still works using a generic destination-safe plan.
-        """
-        location = location or {}
-        lat = location.get("latitude")
-        lon = location.get("longitude")
-        if lat is None or lon is None:
-            return []
-        try:
-            params = urlencode({
-                "action": "query",
-                "list": "geosearch",
-                "gscoord": f"{float(lat)}|{float(lon)}",
-                "gsradius": 10000,
-                "gslimit": max(5, min(30, int(limit))),
-                "gsnamespace": 0,
-                "format": "json",
-                "origin": "*",
-            })
-            request = Request(
-                f"https://en.wikipedia.org/w/api.php?{params}",
-                headers={"User-Agent": "WanderAI/1.0 travel-planner"},
-            )
-            with urlopen(request, timeout=5) as response:
-                import json as _json
-                payload = _json.loads(response.read().decode("utf-8"))
-            rows = (payload.get("query") or {}).get("geosearch") or []
-            result = []
-            seen = set()
-            for row in rows:
-                name = str(row.get("title") or "").strip()
-                if not name:
-                    continue
-                key = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
-                if key in seen:
-                    continue
-                seen.add(key)
-                distance = row.get("dist")
-                distance_text = f" About {round(float(distance) / 1000, 1)} km away." if distance is not None else ""
-                result.append({
-                    "name": name,
-                    "description": f"Nearby point of interest for {destination}.{distance_text}"
-                })
-            return result
-        except Exception:
-            return []
 
     @staticmethod
     def _has_specific_itinerary(days_data, destination):
