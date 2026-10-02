@@ -1,0 +1,11 @@
+# Local secrets
+.env
+.streamlit/secrets.toml
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
